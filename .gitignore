@@ -1,0 +1,29 @@
+# ---- Secrets / local settings (NEVER commit - may contain DB passwords) ----
+*_config.json
+sla_fix_config.json
+repush_config.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Meter data files a user might drop in the folder ----
+*.xlsx
+*.xls
+*.csv
