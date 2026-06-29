@@ -155,11 +155,17 @@ def build_repush_from_backup(repush_table, backup_table):
     """
     Step 4: copy the backed-up rows (temp2) into the per-sequence repush table,
     stamping the datarepushid (the only %s) onto every row.
+
+    "on conflict do nothing" guards against the same (datarepushid, sequenceid)
+    appearing twice - which happens when temp2 holds duplicate sequenceids
+    (i.e. the source table has more than one row for a sequenceid). Each
+    sequenceid is then inserted once.
     """
     return sql.SQL(
         "insert into {} (datarepushid, sequenceid, meternumber, rtcdateat, createdat) "
         "select %s, sequenceid, meternumber, rtcdateat, createdat "
-        "from {}"
+        "from {} "
+        "on conflict do nothing"
     ).format(_ident(repush_table), _ident(backup_table))
 
 
