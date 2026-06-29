@@ -37,7 +37,8 @@ class App:
         root.minsize(700, 780)
 
         self.vars = {}
-        self.captured_seqids = None   # seqids from the last Check
+        self.breach = None            # (table, where_sql, params) from the last Check
+        self.last_count = 0           # breach count from the last Check
         self.meter_values = None      # meter numbers loaded from a file
         self.backup_done = False
         self.update_done = False
@@ -87,10 +88,10 @@ class App:
         ttk.Checkbutton(tgt, text="Create backup table if it doesn't exist",
                         variable=self.vars["create_backup"]).grid(
             row=2, column=1, sticky="w", padx=8, pady=2)
-        self._row(tgt, "Repush table", "repush_table", 3,
+        self._row(tgt, "Repush table (by sequence)", "repush_table", 3,
                   default=config.DEFAULT_REPUSH)
-        self._row(tgt, "Batch size", "batch_size", 4,
-                  default=config.DEFAULT_BATCH_SIZE, width=10)
+        self._row(tgt, "Settings table", "settings_table", 4,
+                  default=config.DEFAULT_SETTINGS)
         tgt.columnconfigure(1, weight=1)
 
         ttk.Button(parent, text="Save settings",
@@ -118,6 +119,18 @@ class App:
                   text="Dates: YYYY-MM-DD HH:MM").grid(
             row=6, column=1, sticky="w", padx=8)
         params.columnconfigure(1, weight=1)
+
+        rp = ttk.LabelFrame(parent, text="Repush settings (step 4)")
+        rp.pack(fill="x", **pad)
+        self._row(rp, "Profile name", "profilename", 0,
+                  default=config.DEFAULT_PROFILENAME, width=24)
+        ttk.Label(rp, foreground="#888", wraplength=680, justify="left",
+                  text=("Written to data_repush_settings.profilename. The "
+                        "datarepushid is taken automatically from "
+                        "data_repush_settings (a row is created if none "
+                        "exists), so you don't enter it.")).grid(
+            row=1, column=1, sticky="w", padx=8)
+        rp.columnconfigure(1, weight=1)
 
         self._build_workflow_buttons(parent)
         self._build_result(parent)
@@ -307,20 +320,6 @@ class App:
         self.progress_var.set("running in background...")
         self._start_timer()
 
-    def _begin_determinate(self, action, total):
-        """For Backup/Update/Repush: progress measured against the seqid list."""
-        self._action = action
-        self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=max(total, 1), value=0)
-        self.progress_var.set(f"0 / {total:,}")
-        self._start_timer()
-
-    def _on_progress(self, done, total):
-        """Called (via root.after) after each committed batch."""
-        self.progress.configure(value=done)
-        self.progress_var.set(f"{done:,} / {total:,}")
-        self.log(f"  {self._action}: {done:,} / {total:,} done.")
-
     def _end_progress(self):
         self._timer_on = False
         self.progress.stop()
@@ -329,16 +328,14 @@ class App:
             self.progress.configure(value=self.progress["maximum"])
         self.progress_var.set("")
 
-    def _batch_size(self):
-        try:
-            size = int(self.vars["batch_size"].get())
-        except (ValueError, KeyError):
-            size = int(config.DEFAULT_BATCH_SIZE)
-        return max(size, 1)
+    def _sql_cb(self):
+        """Thread-safe callback: db_ops sends the exact SQL here to be logged."""
+        return lambda text: self.root.after(0, self._log_sql_text, text)
 
-    def _progress_cb(self):
-        """A thread-safe callback that marshals batch progress onto the UI."""
-        return lambda done, total: self.root.after(0, self._on_progress, done, total)
+    def _log_sql_text(self, text):
+        self.log("  SQL executed:")
+        for line in text.splitlines():
+            self.log("    " + line)
 
     # ===================== input validation =====================
     def _validate(self):
@@ -382,19 +379,18 @@ class App:
     def do_check(self):
         try:
             pid, rf, rt, cutoff = self._validate()
-            where, params, preview = self._breach_where(pid, rf, rt, cutoff)
+            where, params, _ = self._breach_where(pid, rf, rt, cutoff)
         except ValueError as e:
             messagebox.showwarning("Check inputs", str(e))
             return
 
         tbl = self.vars["table"].get().strip() or config.DEFAULT_TABLE
         self.log("-" * 60)
-        self.log("CHECK:")
-        self.log(f"select sequenceid from {tbl}\nwhere " + "\n  and ".join(preview))
+        self.log("CHECK: counting SLA breaches...")
         self._disable_all()
         self.status_var.set("Checking... (this can take several minutes)")
         self.result_var.set("...")
-        self.captured_seqids = None
+        self.breach = (tbl, where, params)
         self.backup_done = False
         self.update_done = False
         self._begin_indeterminate("CHECK")
@@ -405,19 +401,19 @@ class App:
 
     def _do_check(self, conn_kw, table, where, params):
         try:
-            seqids = db_ops.run_check(conn_kw, table, where, params)
-            self.root.after(0, self._check_done, seqids)
+            count = db_ops.run_check(conn_kw, table, where, params,
+                                     sql_cb=self._sql_cb())
+            self.root.after(0, self._check_done, count)
         except Exception as e:
             self.root.after(0, self._on_error, str(e))
 
-    def _check_done(self, seqids):
+    def _check_done(self, count):
         self._end_progress()
-        self.captured_seqids = seqids
-        self.result_var.set(f"{len(seqids):,}")
+        self.last_count = count
+        self.result_var.set(f"{count:,}")
         self.check_btn.configure(state="normal")
-        self.log(f"  -> {len(seqids):,} breaching record(s) "
-                 f"(found in {self._elapsed}s).")
-        if seqids:
+        self.log(f"  -> {count:,} breaching record(s) (counted in {self._elapsed}s).")
+        if count:
             self.backup_btn.configure(state="normal")
             self.status_var.set("Breaches found - run backup first.")
         else:
@@ -425,35 +421,33 @@ class App:
 
     # ===================== step 2: BACKUP =====================
     def do_backup(self):
-        if not self.captured_seqids:
+        if not self.breach:
             messagebox.showinfo("Nothing to do", "Run Check first.")
             return
         backup = self.vars["backup_table"].get().strip() or config.DEFAULT_BACKUP
         if not messagebox.askyesno(
                 "Confirm backup",
-                f"This will back up {len(self.captured_seqids):,} row(s) "
+                f"This will back up {self.last_count:,} breaching row(s) "
                 f"into '{backup}'.\n\nProceed?"):
             return
 
+        table, where, params = self.breach
         self._disable_all()
         self.status_var.set("Backing up...")
-        self._begin_determinate("BACKUP", len(self.captured_seqids))
+        self.log("-" * 60)
+        self.log("BACKUP: copying breaching rows into the backup table...")
+        self._begin_indeterminate("BACKUP")
         threading.Thread(
             target=self._do_backup,
-            args=(self._conn_kw(),
-                  self.vars["table"].get().strip() or config.DEFAULT_TABLE,
-                  backup,
-                  list(self.captured_seqids),
-                  self.vars["create_backup"].get(),
-                  self._batch_size()),
+            args=(self._conn_kw(), table, backup, where, params,
+                  self.vars["create_backup"].get()),
             daemon=True).start()
 
-    def _do_backup(self, conn_kw, table, backup, seqids, create_backup, batch_size):
+    def _do_backup(self, conn_kw, table, backup, where, params, create_backup):
         try:
-            count = db_ops.run_backup(conn_kw, table, backup, seqids,
+            count = db_ops.run_backup(conn_kw, table, backup, where, params,
                                       create_backup=create_backup,
-                                      batch_size=batch_size,
-                                      progress_cb=self._progress_cb())
+                                      sql_cb=self._sql_cb())
             self.root.after(0, self._backup_done, count)
         except Exception as e:
             self.root.after(0, self._on_error, f"{e}\n\nBackup rolled back.")
@@ -461,7 +455,8 @@ class App:
     def _backup_done(self, count):
         self._end_progress()
         self.backup_done = True
-        self.log(f"BACKUP: backed up {count:,} row(s).")
+        self.log(f"BACKUP: backed up {count:,} row(s) into the backup table "
+                 "(truncated first).")
         self.status_var.set("Backup complete. Ready for update.")
         self.check_btn.configure(state="normal")
         self.backup_btn.configure(state="normal")
@@ -469,35 +464,32 @@ class App:
 
     # ===================== step 3: UPDATE =====================
     def do_update(self):
-        if not self.captured_seqids:
-            messagebox.showinfo("Nothing to do", "Run Check first.")
-            return
         if not self.backup_done:
             messagebox.showwarning("Backup required",
-                                   "Run backup before updating createdat.")
+                                   "Run Check and Backup before updating createdat.")
             return
         if not messagebox.askyesno(
                 "Confirm update",
-                f"This will update createdat for {len(self.captured_seqids):,} "
+                f"This will update createdat for the {self.last_count:,} backed-up "
                 f"row(s).\n\nProceed?"):
             return
 
+        table, where, params = self.breach
+        backup = self.vars["backup_table"].get().strip() or config.DEFAULT_BACKUP
         self._disable_all()
         self.status_var.set("Updating createdat...")
-        self._begin_determinate("UPDATE", len(self.captured_seqids))
+        self.log("-" * 60)
+        self.log("UPDATE: rewriting createdat on backed-up breaching rows...")
+        self._begin_indeterminate("UPDATE")
         threading.Thread(
             target=self._do_update,
-            args=(self._conn_kw(),
-                  self.vars["table"].get().strip() or config.DEFAULT_TABLE,
-                  list(self.captured_seqids),
-                  self._batch_size()),
+            args=(self._conn_kw(), table, backup, where, params),
             daemon=True).start()
 
-    def _do_update(self, conn_kw, table, seqids, batch_size):
+    def _do_update(self, conn_kw, table, backup, where, params):
         try:
-            count = db_ops.run_update(conn_kw, table, seqids,
-                                      batch_size=batch_size,
-                                      progress_cb=self._progress_cb())
+            count = db_ops.run_update(conn_kw, table, backup, where, params,
+                                      sql_cb=self._sql_cb())
             self.root.after(0, self._update_done, count)
         except Exception as e:
             self.root.after(0, self._on_error, f"{e}\n\nUpdate rolled back.")
@@ -513,48 +505,61 @@ class App:
 
     # ===================== step 4: REPUSH =====================
     def do_repush(self):
-        if not self.captured_seqids:
-            messagebox.showinfo("Nothing to do", "Run Check first.")
-            return
         if not self.update_done:
             messagebox.showwarning("Update required",
-                                   "Run update before repushing.")
+                                   "Run Check, Backup and Update before repushing.")
             return
-        repush = self.vars["repush_table"].get().strip() or config.DEFAULT_REPUSH
+        profilename = self.vars["profilename"].get().strip()
+        if not profilename:
+            messagebox.showwarning("Profile name required",
+                                   "Enter a profile name (Repush settings) first.")
+            return
+        projectid = self.vars["projectid"].get().strip()
+        by_seq = self.vars["repush_table"].get().strip() or config.DEFAULT_REPUSH
+        settings = self.vars["settings_table"].get().strip() or config.DEFAULT_SETTINGS
+        backup = self.vars["backup_table"].get().strip() or config.DEFAULT_BACKUP
         if not messagebox.askyesno(
                 "Confirm repush",
-                f"This will insert {len(self.captured_seqids):,} row(s) into "
-                f"'{repush}'.\n\nProceed?"):
+                f"This will TRUNCATE '{by_seq}', copy the backup ('{backup}') into "
+                f"it, and update one row in '{settings}'\n"
+                f"(projectid={projectid}, profilename='{profilename}', "
+                f"datarepushid taken from '{settings}').\n\nProceed?"):
             return
 
         self._disable_all()
         self.status_var.set("Repushing...")
-        self._begin_determinate("REPUSH", len(self.captured_seqids))
+        self.log("-" * 60)
+        self.log(f"REPUSH: truncating '{by_seq}', copying from '{backup}', "
+                 f"updating '{settings}'...")
+        self._begin_indeterminate("REPUSH")
         threading.Thread(
             target=self._do_repush,
-            args=(self._conn_kw(),
-                  self.vars["table"].get().strip() or config.DEFAULT_TABLE,
-                  repush,
-                  list(self.captured_seqids),
-                  self._batch_size()),
+            args=(self._conn_kw(), by_seq, backup, settings, projectid, profilename),
             daemon=True).start()
 
-    def _do_repush(self, conn_kw, table, repush, seqids, batch_size):
+    def _do_repush(self, conn_kw, by_seq, backup, settings, projectid, profilename):
         try:
-            count = db_ops.run_repush(conn_kw, table, repush, seqids,
-                                      batch_size=batch_size,
-                                      progress_cb=self._progress_cb())
-            self.root.after(0, self._repush_done, count)
+            result = db_ops.run_repush(conn_kw, by_seq, backup, settings,
+                                       projectid, profilename,
+                                       sql_cb=self._sql_cb())
+            self.root.after(0, self._repush_done, result)
         except Exception as e:
             self.root.after(0, self._on_error, f"{e}\n\nRepush rolled back.")
 
-    def _repush_done(self, count):
+    def _repush_done(self, result):
         self._end_progress()
-        self.log(f"REPUSH: inserted {count:,} row(s) into repush table.")
+        self.log(f"REPUSH: inserted {result['inserted']:,} row(s) into the repush "
+                 f"table with datarepushid = {result['datarepushid']}.")
+        self.log(f"  settings window: startdate = {result['startdate']}, "
+                 f"enddate = {result['enddate']}")
         self.status_var.set("Repush complete.")
         self.check_btn.configure(state="normal")
         self.repush_btn.configure(state="normal")
-        messagebox.showinfo("Done", f"Repush complete: {count:,} rows.")
+        messagebox.showinfo(
+            "Done",
+            f"Repush complete: {result['inserted']:,} rows.\n"
+            f"datarepushid = {result['datarepushid']}\n"
+            f"startdate = {result['startdate']}\nenddate = {result['enddate']}")
 
     # ===================== errors / config =====================
     def _on_error(self, msg):

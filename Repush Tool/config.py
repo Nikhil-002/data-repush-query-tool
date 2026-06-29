@@ -12,11 +12,12 @@ import os
 # ---- defaults shown in the UI the first time it is opened ----
 DEFAULT_TABLE = "meter_blockloadprofile"          # main blockload table
 DEFAULT_BACKUP = "temp2"                           # backup table for breaching rows
-DEFAULT_REPUSH = "data_repush_settings_by_sequence"  # repush target table
+DEFAULT_REPUSH = "data_repush_settings_by_sequence"  # per-sequence repush table
+DEFAULT_SETTINGS = "data_repush_settings"          # parent settings table (owns datarepushid)
 DEFAULT_SLA_HOURS = "11"                            # SLA window in hours
 DEFAULT_METER_SOURCE = "table"                      # "table" or "file"
 DEFAULT_METER_TABLE = "june18"                      # example table name
-DEFAULT_BATCH_SIZE = "5000"                         # seqids per batch for steps 2-4
+DEFAULT_PROFILENAME = "EVENTS"                      # profilename written to settings
 
 # Settings file lives right beside the app folder.
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
