@@ -197,7 +197,7 @@ class App:
                                      command=self.do_update, state="disabled")
         self.update_btn.pack(side="left", padx=8, pady=8)
         self.repush_btn = ttk.Button(wf, text="4.  Repush breaching rows",
-                                     command=self.do_repush, state="disabled")
+                                     command=self.do_repush)
         self.repush_btn.pack(side="left", padx=8, pady=8)
 
     def _build_result(self, parent):
@@ -375,6 +375,23 @@ class App:
         for b in (self.check_btn, self.backup_btn, self.update_btn, self.repush_btn):
             b.configure(state="disabled")
 
+    def _restore_buttons(self):
+        """
+        Re-enable buttons based on what is possible right now (called after every
+        step finishes or errors, so a failed step can be retried):
+          * Check  - always.
+          * Backup - once Check (this session) found breaches.
+          * Update - once Backup ran this session.
+          * Repush - always: it reads temp2 + the settings table directly, so it
+                     can run on its own (e.g. to retry after an error or after a
+                     restart) without redoing Check/Backup/Update.
+        """
+        self.check_btn.configure(state="normal")
+        self.backup_btn.configure(
+            state="normal" if (self.breach and self.last_count) else "disabled")
+        self.update_btn.configure(state="normal" if self.backup_done else "disabled")
+        self.repush_btn.configure(state="normal")
+
     # ===================== step 1: CHECK =====================
     def do_check(self):
         try:
@@ -411,13 +428,12 @@ class App:
         self._end_progress()
         self.last_count = count
         self.result_var.set(f"{count:,}")
-        self.check_btn.configure(state="normal")
         self.log(f"  -> {count:,} breaching record(s) (counted in {self._elapsed}s).")
         if count:
-            self.backup_btn.configure(state="normal")
             self.status_var.set("Breaches found - run backup first.")
         else:
             self.status_var.set("No breaches. Nothing to fix.")
+        self._restore_buttons()
 
     # ===================== step 2: BACKUP =====================
     def do_backup(self):
@@ -458,9 +474,7 @@ class App:
         self.log(f"BACKUP: backed up {count:,} row(s) into the backup table "
                  "(truncated first).")
         self.status_var.set("Backup complete. Ready for update.")
-        self.check_btn.configure(state="normal")
-        self.backup_btn.configure(state="normal")
-        self.update_btn.configure(state="normal")
+        self._restore_buttons()
 
     # ===================== step 3: UPDATE =====================
     def do_update(self):
@@ -499,16 +513,10 @@ class App:
         self.update_done = True
         self.log(f"UPDATE: updated createdat on {count:,} row(s).")
         self.status_var.set("Update complete. Ready for repush.")
-        self.check_btn.configure(state="normal")
-        self.update_btn.configure(state="normal")
-        self.repush_btn.configure(state="normal")
+        self._restore_buttons()
 
     # ===================== step 4: REPUSH =====================
     def do_repush(self):
-        if not self.update_done:
-            messagebox.showwarning("Update required",
-                                   "Run Check, Backup and Update before repushing.")
-            return
         profilename = self.vars["profilename"].get().strip()
         if not profilename:
             messagebox.showwarning("Profile name required",
@@ -552,21 +560,24 @@ class App:
                  f"table with datarepushid = {result['datarepushid']}.")
         self.log(f"  settings window: startdate = {result['startdate']}, "
                  f"enddate = {result['enddate']}")
+        self.log(f"  snapshot: appended {result['snapshot_count']:,} row(s) into "
+                 f"'{result['snapshot_table']}'.")
         self.status_var.set("Repush complete.")
-        self.check_btn.configure(state="normal")
-        self.repush_btn.configure(state="normal")
+        self._restore_buttons()
         messagebox.showinfo(
             "Done",
             f"Repush complete: {result['inserted']:,} rows.\n"
             f"datarepushid = {result['datarepushid']}\n"
-            f"startdate = {result['startdate']}\nenddate = {result['enddate']}")
+            f"startdate = {result['startdate']}\nenddate = {result['enddate']}\n"
+            f"snapshot: {result['snapshot_count']:,} rows -> "
+            f"{result['snapshot_table']}")
 
     # ===================== errors / config =====================
     def _on_error(self, msg):
         self._end_progress()
         self.status_var.set("Error.")
-        self.check_btn.configure(state="normal")
         self.log("ERROR: " + msg)
+        self._restore_buttons()
         messagebox.showerror("Failed", msg)
 
     def _save_config(self):

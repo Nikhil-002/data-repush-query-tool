@@ -45,7 +45,11 @@ THE FOUR STEPS (one button each, run in order)
                e. updates the single data_repush_settings row:
                   projectid (from Run params), profilename (Repush settings box),
                   startdate = min, enddate = max, minsequenceid = 0,
-                  maxsequenceid = 0, isspecificseqrepush = true.
+                  maxsequenceid = 0, isspecificseqrepush = true;
+               f. APPENDS the same rows into a per-day snapshot table named
+                  repush_DDMM, where DD/MM is the day+month of the EARLIEST
+                  rtcdateat (e.g. a window starting 17 Jun -> repush_1706). The
+                  table is created if missing; re-running the same day appends.
              You enter only the Profile name; everything else is derived.
 
 Each step is gated: Backup unlocks after Check, Update after Backup, Repush

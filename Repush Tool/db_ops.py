@@ -29,8 +29,10 @@ from queries import (
     build_settings_insert,
     build_delete_other_settings,
     build_repush_from_backup,
-    build_minmax_createdat,
+    build_repush_window,
     build_settings_update,
+    build_create_snapshot_like,
+    build_snapshot_insert,
 )
 
 _CONNECT_TIMEOUT = 10
@@ -183,18 +185,30 @@ def run_repush(conn_kw, by_sequence_table, backup_table, settings_table,
                 raise RuntimeError(
                     "Backup table is empty - run Backup (step 2) before Repush.")
 
-            # 4. createdat window from the freshly filled per-sequence table
-            cur.execute(build_minmax_createdat(by_sequence_table))
-            startdate, enddate = cur.fetchone()
+            # 4. window from the freshly filled per-sequence table:
+            #    createdat min/max (for settings) + DDMM of earliest rtcdateat
+            cur.execute(build_repush_window(by_sequence_table))
+            startdate, enddate, ddmm = cur.fetchone()
 
             # 5. write the window + metadata back to the single settings row
             update_stmt = build_settings_update(settings_table)
             update_params = (projectid, profilename, startdate, enddate, datarepushid)
             _log_sql(cur, update_stmt, update_params, sql_cb)
             cur.execute(update_stmt, update_params)
+
+            # 6. append the rows into the per-day snapshot table repush_DDMM
+            snapshot_table = f"repush_{ddmm}"
+            create_snap = build_create_snapshot_like(snapshot_table, by_sequence_table)
+            _log_sql(cur, create_snap, None, sql_cb)
+            cur.execute(create_snap)
+            snap_insert = build_snapshot_insert(snapshot_table, by_sequence_table)
+            _log_sql(cur, snap_insert, None, sql_cb)
+            cur.execute(snap_insert)
+            snapshot_count = cur.rowcount
         conn.commit()
         return {"datarepushid": datarepushid, "inserted": inserted,
-                "startdate": startdate, "enddate": enddate}
+                "startdate": startdate, "enddate": enddate,
+                "snapshot_table": snapshot_table, "snapshot_count": snapshot_count}
     except Exception:
         conn.rollback()
         raise

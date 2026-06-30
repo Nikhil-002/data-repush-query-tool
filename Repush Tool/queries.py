@@ -52,10 +52,31 @@ def build_count_rows(table):
     return sql.SQL("select count(*) from {}").format(_ident(table))
 
 
-def build_minmax_createdat(table):
-    """Return (min(createdat), max(createdat)) for a table."""
-    return sql.SQL("select min(createdat), max(createdat) from {}").format(
-        _ident(table))
+def build_repush_window(table):
+    """
+    Return (min(createdat), max(createdat), DDMM) for a table, where DDMM is the
+    day+month of the EARLIEST rtcdateat. to_char uses the session timezone, the
+    same way the typed RTC inputs are interpreted, so for +00 data it is the UTC
+    day. Used both for the settings startdate/enddate and to name the per-day
+    repush_DDMM snapshot table.
+    """
+    return sql.SQL(
+        "select min(createdat), max(createdat), to_char(min(rtcdateat), 'DDMM') "
+        "from {}"
+    ).format(_ident(table))
+
+
+def build_create_snapshot_like(snapshot_table, source_table):
+    """Create the per-day snapshot table (same columns as source) if it's missing."""
+    return sql.SQL(
+        "create table if not exists {} as select * from {} where false"
+    ).format(_ident(snapshot_table), _ident(source_table))
+
+
+def build_snapshot_insert(snapshot_table, source_table):
+    """Append every source row into the per-day snapshot table."""
+    return sql.SQL("insert into {} select * from {}").format(
+        _ident(snapshot_table), _ident(source_table))
 
 
 # ------------------------------- step 1: CHECK ------------------------------
