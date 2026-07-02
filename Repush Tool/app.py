@@ -81,7 +81,7 @@ class App:
 
         tgt = ttk.LabelFrame(parent, text="Target tables")
         tgt.pack(fill="x", **pad)
-        self._row(tgt, "Main table", "table", 0, default=config.DEFAULT_TABLE)
+        self._build_main_table_row(tgt, 0)
         self._row(tgt, "Backup table (temp2)", "backup_table", 1,
                   default=config.DEFAULT_BACKUP)
         self.vars["create_backup"] = tk.BooleanVar(value=True)
@@ -94,10 +94,11 @@ class App:
         ttk.Checkbutton(tgt, text="Create temp1 table if it doesn't exist",
                         variable=self.vars["create_temp1"]).grid(
             row=4, column=1, sticky="w", padx=8, pady=2)
+        # Repush + settings tables are fixed - shown for reference, not editable.
         self._row(tgt, "Repush table (by sequence)", "repush_table", 5,
-                  default=config.DEFAULT_REPUSH)
+                  default=config.DEFAULT_REPUSH, state="readonly")
         self._row(tgt, "Settings table", "settings_table", 6,
-                  default=config.DEFAULT_SETTINGS)
+                  default=config.DEFAULT_SETTINGS, state="readonly")
         tgt.columnconfigure(1, weight=1)
 
         ttk.Button(parent, text="Save settings",
@@ -106,6 +107,28 @@ class App:
                   text=("Connection + targets are saved to repush_config.json "
                         "next to this app. Password is only saved if 'Remember "
                         "password' is ticked.")).pack(anchor="w", padx=12)
+
+    def _build_main_table_row(self, parent, row):
+        """Main table as a profile dropdown (LS/DP/...) mapped to the DB table."""
+        ttk.Label(parent, text="Main table").grid(row=row, column=0, sticky="e",
+                                                   padx=8, pady=4)
+        self.vars["profile"] = tk.StringVar(value=config.DEFAULT_PROFILE)
+        self.vars["table"] = tk.StringVar(value=config.DEFAULT_TABLE)
+        mainf = ttk.Frame(parent)
+        mainf.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
+        self.profile_combo = ttk.Combobox(
+            mainf, textvariable=self.vars["profile"], state="readonly", width=10,
+            values=list(config.PROFILE_TABLES.keys()))
+        self.profile_combo.pack(side="left")
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_change)
+        # read-only label so the operator can see the real table the profile maps to
+        ttk.Label(mainf, textvariable=self.vars["table"],
+                  foreground="#555").pack(side="left", padx=10)
+
+    def _on_profile_change(self, _event=None):
+        table = config.PROFILE_TABLES.get(self.vars["profile"].get())
+        if table:
+            self.vars["table"].set(table)
 
     def _build_run(self, parent):
         pad = {"padx": 8, "pady": 4}
@@ -270,7 +293,8 @@ class App:
         self.log_text = tk.Text(logf, height=14, wrap="word")
         self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
 
-    def _row(self, parent, label, key, row, default="", show=None, width=None):
+    def _row(self, parent, label, key, row, default="", show=None, width=None,
+             state=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e",
                                            padx=8, pady=4)
         self.vars[key] = tk.StringVar(value=default)
@@ -280,6 +304,8 @@ class App:
         if width:
             kw["width"] = width
         e = ttk.Entry(parent, **kw)
+        if state:
+            e.configure(state=state)
         e.grid(row=row, column=1, sticky="ew" if not width else "w",
                padx=8, pady=4)
 
@@ -697,6 +723,7 @@ class App:
         for k, val in data.items():
             if k in self.vars:
                 self.vars[k].set(val)
+        self._on_profile_change()      # keep Main table in sync with the profile
         self._toggle_meter()
         self._toggle_cutoff()
         self._toggle_created_range()
