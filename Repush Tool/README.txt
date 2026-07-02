@@ -15,9 +15,12 @@ Requirements:
 THE FOUR STEPS (one button each, run in order)
 ----------------------------------------------
 1. CHECK   - COUNTS the rows that breached the SLA (it does not pull the rows
-             back). A row breaches when:
-                 createdat > cutoff      (cutoff = rtc_to + SLA hours)
-             i.e. the data arrived later than the SLA deadline.
+             back). Two mutually-exclusive createdat modes:
+               * default (tick OFF): createdat > cutoff
+                 (cutoff = rtc_to + SLA hours) - the data arrived too late.
+               * tick "Also limit createdat (step 1)" ON: the cutoff test is
+                 DROPPED and replaced by your own createdat > / createdat <
+                 bounds (each used only if filled). At least one is required.
 
 2. BACKUP  - TRUNCATES the backup table (so it holds only this run) and copies
              the breaching rows in, keeping:
@@ -32,28 +35,42 @@ THE FOUR STEPS (one button each, run in order)
              a row that arrives between Backup and Update is never modified.
 
 4. REPUSH  - one transaction that, in order:
-               a. TRUNCATES the per-sequence repush table
+               a. (re)builds temp1 - the FULL good dataset to repush. Unlike
+                  temp2 (only the LATE rows), temp1 is every packet for the meter
+                  list in the RTC window whose createdat lands inside the
+                  Createdat window:
+                      projectid = <Run param>
+                      rtcdateat BETWEEN <RTC from> AND <RTC to>
+                      createdat BETWEEN <Createdat from> AND <Createdat to>
+                      meternumber in (select meternumber from <meter table>)
+                  i.e. the rows that were already in-SLA (LS) PLUS the ones
+                  step 3 just pulled back inside SLA (their rewritten createdat
+                  now falls in this window). temp1 is created-if-missing then
+                  TRUNCATED so it holds only this run;
+               b. TRUNCATES the per-sequence repush table
                   (data_repush_settings_by_sequence);
-               b. makes sure data_repush_settings has exactly ONE row and takes
+               c. makes sure data_repush_settings has exactly ONE row and takes
                   its datarepushid (creates a row if the table is empty; if it
                   has several, keeps the greatest id and deletes the rest) - so
                   you DON'T type the datarepushid;
-               c. copies the backup rows into the per-sequence table, stamping
-                  that datarepushid onto every row;
-               d. reads min(createdat)/max(createdat) back from the per-sequence
-                  table;
-               e. updates the single data_repush_settings row:
+               d. copies temp1 into the per-sequence table, stamping that
+                  datarepushid onto every row (on conflict do nothing);
+               e. reads min(createdat)/max(createdat) back from temp1;
+               f. updates the single data_repush_settings row:
                   projectid (from Run params), profilename (Repush settings box),
                   startdate = min, enddate = max, minsequenceid = 0,
                   maxsequenceid = 0, isspecificseqrepush = true;
-               f. APPENDS the same rows into a per-day snapshot table named
-                  repush_DDMM, where DD/MM is the day+month of the EARLIEST
+               g. APPENDS the per-sequence rows into a per-day snapshot table
+                  named repush_DDMM, where DD/MM is the day+month of the EARLIEST
                   rtcdateat (e.g. a window starting 17 Jun -> repush_1706). The
                   table is created if missing; re-running the same day appends.
-             You enter only the Profile name; everything else is derived.
+             You enter the Profile name + the Createdat window; the rest is
+             derived. (temp1 reads the main table directly, so run Update first
+             so the just-fixed createdats are reflected.)
 
-Each step is gated: Backup unlocks after Check, Update after Backup, Repush
-after Update. Backup, Update and Repush ask for confirmation first.
+Each step is gated: Backup unlocks after Check, Update after Backup. Repush can
+run on its own (it rebuilds temp1 from the current Run parameters). Backup,
+Update and Repush ask for confirmation first.
 
 Every button prints the EXACT SQL it runs into the "SQL / log" panel (rendered
 with the real table names and parameter values already filled in), so you can

@@ -10,10 +10,14 @@ a "running..." bar + elapsed timer while these run on a background thread.
   * BACKUP - truncate the backup table, then INSERT ... SELECT the breaching
              rows; returns the row count.
   * UPDATE - one set-based UPDATE; returns the row count.
-  * REPUSH - a single transaction that truncates the per-sequence repush table,
-             ensures one parent row in data_repush_settings (to get the
-             datarepushid), copies the backup into the per-sequence table, then
-             writes the createdat window back to the settings row.
+  * REPUSH - a single transaction that first (re)builds temp1 - the full good
+             dataset (every packet for the meter list in the RTC window whose
+             createdat now sits inside the createdat window, i.e. the original
+             in-SLA rows plus the ones step 3 just pulled back inside SLA) -
+             then truncates the per-sequence repush table, ensures one parent
+             row in data_repush_settings (to get the datarepushid), copies
+             temp1 into the per-sequence table, and writes temp1's createdat
+             window back to the settings row.
 """
 
 import psycopg2
@@ -152,51 +156,69 @@ def _ensure_settings_row(cur, settings_table, projectid, profilename, sql_cb):
     return datarepushid
 
 
-def run_repush(conn_kw, by_sequence_table, backup_table, settings_table,
-               projectid, profilename, sql_cb=None):
+def run_repush(conn_kw, source_table, temp1_table, by_sequence_table,
+               settings_table, projectid, profilename,
+               temp1_where, temp1_params, create_temp1=True, sql_cb=None):
     """
     Step 4 (single transaction):
-      1. truncate the per-sequence repush table;
-      2. ensure one settings row + get its datarepushid;
-      3. copy the backup (temp2) into the per-sequence table with that id;
-      4. read min/max(createdat) back from the per-sequence table;
-      5. write projectid/profilename/window back to the settings row.
+      1. (optionally create) + truncate temp1, then fill it from the main table
+         with the full good dataset (temp1_where);
+      2. truncate the per-sequence repush table;
+      3. ensure one settings row + get its datarepushid;
+      4. copy temp1 into the per-sequence table with that id;
+      5. read min/max(createdat) + DDMM back from temp1;
+      6. write projectid/profilename/window back to the settings row;
+      7. append the rows into the per-day snapshot table repush_DDMM.
 
-    Returns dict(datarepushid, inserted, startdate, enddate).
+    Returns dict(datarepushid, temp1_count, inserted, startdate, enddate,
+                 snapshot_table, snapshot_count).
     """
     conn = _connect(conn_kw)
     try:
         with conn.cursor() as cur:
-            # 1. clear the per-sequence (child) table first
+            # 1. (re)build temp1 = the full good dataset to repush
+            if create_temp1:
+                cur.execute(build_create_backup_table(temp1_table, source_table))
+            trunc_t1 = build_truncate(temp1_table)
+            _log_sql(cur, trunc_t1, None, sql_cb)
+            cur.execute(trunc_t1)
+
+            fill_t1 = build_backup_insert(temp1_table, source_table, temp1_where)
+            _log_sql(cur, fill_t1, temp1_params, sql_cb)
+            cur.execute(fill_t1, temp1_params)
+            temp1_count = cur.rowcount
+            if temp1_count == 0:
+                raise RuntimeError(
+                    "temp1 is empty - the createdat/RTC/meter filter matched no "
+                    "rows in the main table. Check the Run parameters.")
+
+            # 2. clear the per-sequence (child) table
             trunc = build_truncate(by_sequence_table)
             _log_sql(cur, trunc, None, sql_cb)
             cur.execute(trunc)
 
-            # 2. one parent settings row -> datarepushid
+            # 3. one parent settings row -> datarepushid
             datarepushid = _ensure_settings_row(
                 cur, settings_table, projectid, profilename, sql_cb)
 
-            # 3. copy the backup into the per-sequence table, stamping the id
-            repush_stmt = build_repush_from_backup(by_sequence_table, backup_table)
+            # 4. copy temp1 into the per-sequence table, stamping the id
+            repush_stmt = build_repush_from_backup(by_sequence_table, temp1_table)
             _log_sql(cur, repush_stmt, (datarepushid,), sql_cb)
             cur.execute(repush_stmt, (datarepushid,))
             inserted = cur.rowcount
-            if inserted == 0:
-                raise RuntimeError(
-                    "Backup table is empty - run Backup (step 2) before Repush.")
 
-            # 4. window from the freshly filled per-sequence table:
-            #    createdat min/max (for settings) + DDMM of earliest rtcdateat
-            cur.execute(build_repush_window(by_sequence_table))
+            # 5. window from temp1: createdat min/max (for settings)
+            #    + DDMM of earliest rtcdateat (names the snapshot table)
+            cur.execute(build_repush_window(temp1_table))
             startdate, enddate, ddmm = cur.fetchone()
 
-            # 5. write the window + metadata back to the single settings row
+            # 6. write the window + metadata back to the single settings row
             update_stmt = build_settings_update(settings_table)
             update_params = (projectid, profilename, startdate, enddate, datarepushid)
             _log_sql(cur, update_stmt, update_params, sql_cb)
             cur.execute(update_stmt, update_params)
 
-            # 6. append the rows into the per-day snapshot table repush_DDMM
+            # 7. append the rows into the per-day snapshot table repush_DDMM
             snapshot_table = f"repush_{ddmm}"
             create_snap = build_create_snapshot_like(snapshot_table, by_sequence_table)
             _log_sql(cur, create_snap, None, sql_cb)
@@ -206,8 +228,8 @@ def run_repush(conn_kw, by_sequence_table, backup_table, settings_table,
             cur.execute(snap_insert)
             snapshot_count = cur.rowcount
         conn.commit()
-        return {"datarepushid": datarepushid, "inserted": inserted,
-                "startdate": startdate, "enddate": enddate,
+        return {"datarepushid": datarepushid, "temp1_count": temp1_count,
+                "inserted": inserted, "startdate": startdate, "enddate": enddate,
                 "snapshot_table": snapshot_table, "snapshot_count": snapshot_count}
     except Exception:
         conn.rollback()

@@ -11,8 +11,10 @@ The four workflow steps map onto these builders:
   Step 2 BACKUP  -> build_create_backup_table + build_truncate
                     + build_backup_insert      (temp2 holds ONLY this run)
   Step 3 UPDATE  -> build_update_createdat
-  Step 4 REPUSH  -> build_truncate (by_sequence) + settings-row helpers
-                    + build_repush_from_backup + build_minmax_createdat
+  Step 4 REPUSH  -> build_temp1_where + build_create_backup_table
+                    + build_backup_insert           (temp1: the full good dataset)
+                    + build_truncate (by_sequence) + settings-row helpers
+                    + build_repush_from_backup (from temp1) + build_repush_window
                     + build_settings_update
 
 Table names may be schema-qualified (e.g. "public.meter_blockloadprofile");
@@ -80,14 +82,45 @@ def build_snapshot_insert(snapshot_table, source_table):
 
 
 # ------------------------------- step 1: CHECK ------------------------------
-def build_breach_where(projectid, rtc_from, rtc_to, cutoff,
+def _apply_meter_filter(where, params, preview, use_meter, meter_source,
+                        meter_table, meter_values):
+    """
+    Append the optional 'restrict to meternumbers' predicate (shared by the
+    breach filter in step 1 and the temp1 filter in step 4). Mutates the
+    where/params/preview lists in place.
+    """
+    if not use_meter:
+        return
+    if meter_source == "table":
+        if not meter_table:
+            raise ValueError("Meter filter enabled but meter table is empty.")
+        where.append(sql.SQL(
+            "meternumber in (select meternumber from {})").format(
+                _ident(meter_table)))
+        preview.append(f"meternumber in (select meternumber from {meter_table})")
+    elif meter_source == "file":
+        if not meter_values:
+            raise ValueError("Meter filter enabled but no meter numbers loaded.")
+        where.append(sql.SQL("meternumber = any(%s)"))
+        params.append(meter_values)
+        preview.append(f"meternumber = any(<{len(meter_values)} meter numbers>)")
+    else:
+        raise ValueError("Unknown meter filter source.")
+
+
+def build_breach_where(projectid, rtc_from, rtc_to, cutoff=None,
                        use_meter=False, meter_source="table",
-                       meter_table=None, meter_values=None):
+                       meter_table=None, meter_values=None,
+                       created_gt=None, created_lt=None):
     """
     Build the WHERE clause that identifies SLA-breaching rows.
 
-    A row breaches when its createdat is LATER than the cutoff deadline
-    (cutoff = rtc_to + SLA hours), i.e. the data arrived too late.
+    Two mutually-exclusive createdat modes (the caller picks ONE):
+      * cutoff mode (default): pass ``cutoff`` -> 'createdat > cutoff'
+        (cutoff = rtc_to + SLA hours); a row breaches when it arrived too late.
+      * range mode: leave ``cutoff`` as None and pass created_gt / created_lt
+        -> 'createdat > gt' and/or 'createdat < lt' instead. The cutoff test is
+        NOT applied in this mode.
 
     Returns (where_clause_sql, params, preview_text_lines).
     """
@@ -98,31 +131,68 @@ def build_breach_where(projectid, rtc_from, rtc_to, cutoff,
 
     where = [sql.SQL("projectid = %s"),
              sql.SQL("rtcdateat >= %s"),
+             sql.SQL("rtcdateat <= %s")]
+    params = [projectid, rtc_from, rtc_to]
+    preview = [f"projectid = {projectid}",
+               f"rtcdateat >= '{rtc_from}'",
+               f"rtcdateat <= '{rtc_to}'"]
+
+    if cutoff is not None:
+        where.append(sql.SQL("createdat > %s"))
+        params.append(cutoff)
+        preview.append(f"createdat > '{cutoff}'")
+
+    if created_gt is not None:
+        where.append(sql.SQL("createdat > %s"))
+        params.append(created_gt)
+        preview.append(f"createdat > '{created_gt}'")
+    if created_lt is not None:
+        where.append(sql.SQL("createdat < %s"))
+        params.append(created_lt)
+        preview.append(f"createdat < '{created_lt}'")
+
+    _apply_meter_filter(where, params, preview, use_meter, meter_source,
+                        meter_table, meter_values)
+
+    return sql.SQL(" and ").join(where), params, preview
+
+
+def build_temp1_where(projectid, rtc_from, rtc_to, created_from, created_to,
+                      use_meter=False, meter_source="table",
+                      meter_table=None, meter_values=None):
+    """
+    Build the WHERE clause used to fill temp1 in step 4.
+
+    Unlike the breach filter (which keeps only the LATE rows via
+    'createdat > cutoff'), temp1 is the FULL good dataset to repush: every
+    packet for the meter list in the RTC window whose createdat lands inside
+    the [created_from, created_to] window - i.e. the packets that were already
+    in-SLA (LS) PLUS the ones step 3 just pulled back inside SLA (their
+    rewritten createdat now falls in this window).
+
+    Returns (where_clause_sql, params, preview_text_lines).
+    """
+    if not projectid:
+        raise ValueError("Project ID is required.")
+    if rtc_from > rtc_to:
+        raise ValueError("RTC from is after RTC to.")
+    if created_from > created_to:
+        raise ValueError("Createdat from is after Createdat to.")
+
+    where = [sql.SQL("projectid = %s"),
+             sql.SQL("rtcdateat >= %s"),
              sql.SQL("rtcdateat <= %s"),
-             sql.SQL("createdat > %s")]
-    params = [projectid, rtc_from, rtc_to, cutoff]
+             sql.SQL("createdat >= %s"),
+             sql.SQL("createdat <= %s")]
+    params = [projectid, rtc_from, rtc_to, created_from, created_to]
     preview = [f"projectid = {projectid}",
                f"rtcdateat >= '{rtc_from}'",
                f"rtcdateat <= '{rtc_to}'",
-               f"createdat > '{cutoff}'"]
+               f"createdat >= '{created_from}'",
+               f"createdat <= '{created_to}'"]
 
-    if use_meter:
-        if meter_source == "table":
-            if not meter_table:
-                raise ValueError("Meter filter enabled but meter table is empty.")
-            where.append(sql.SQL(
-                "meternumber in (select meternumber from {})").format(
-                    _ident(meter_table)))
-            preview.append(
-                f"meternumber in (select meternumber from {meter_table})")
-        elif meter_source == "file":
-            if not meter_values:
-                raise ValueError("Meter filter enabled but no meter numbers loaded.")
-            where.append(sql.SQL("meternumber = any(%s)"))
-            params.append(meter_values)
-            preview.append(f"meternumber = any(<{len(meter_values)} meter numbers>)")
-        else:
-            raise ValueError("Unknown meter filter source.")
+    _apply_meter_filter(where, params, preview, use_meter, meter_source,
+                        meter_table, meter_values)
 
     return sql.SQL(" and ").join(where), params, preview
 
@@ -172,22 +242,22 @@ def build_update_createdat(source_table, backup_table, where_clause):
 
 
 # ------------------------------- step 4: REPUSH -----------------------------
-def build_repush_from_backup(repush_table, backup_table):
+def build_repush_from_backup(repush_table, source_table):
     """
-    Step 4: copy the backed-up rows (temp2) into the per-sequence repush table,
-    stamping the datarepushid (the only %s) onto every row.
+    Step 4: copy the source rows (temp1 - the full good dataset) into the
+    per-sequence repush table, stamping the datarepushid (the only %s) onto
+    every row.
 
     "on conflict do nothing" guards against the same (datarepushid, sequenceid)
-    appearing twice - which happens when temp2 holds duplicate sequenceids
-    (i.e. the source table has more than one row for a sequenceid). Each
-    sequenceid is then inserted once.
+    appearing twice - which happens when the source holds duplicate sequenceids
+    (i.e. more than one row for a sequenceid). Each sequenceid is inserted once.
     """
     return sql.SQL(
         "insert into {} (datarepushid, sequenceid, meternumber, rtcdateat, createdat) "
         "select %s, sequenceid, meternumber, rtcdateat, createdat "
         "from {} "
         "on conflict do nothing"
-    ).format(_ident(repush_table), _ident(backup_table))
+    ).format(_ident(repush_table), _ident(source_table))
 
 
 # ---- data_repush_settings (the single parent row that owns the datarepushid) ----

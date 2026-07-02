@@ -25,7 +25,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import config
 from parsing import parse_dt, load_meter_numbers
-from queries import build_breach_where
+from queries import build_breach_where, build_temp1_where
 import db_ops
 
 
@@ -82,15 +82,21 @@ class App:
         tgt = ttk.LabelFrame(parent, text="Target tables")
         tgt.pack(fill="x", **pad)
         self._row(tgt, "Main table", "table", 0, default=config.DEFAULT_TABLE)
-        self._row(tgt, "Backup table", "backup_table", 1,
+        self._row(tgt, "Backup table (temp2)", "backup_table", 1,
                   default=config.DEFAULT_BACKUP)
         self.vars["create_backup"] = tk.BooleanVar(value=True)
         ttk.Checkbutton(tgt, text="Create backup table if it doesn't exist",
                         variable=self.vars["create_backup"]).grid(
             row=2, column=1, sticky="w", padx=8, pady=2)
-        self._row(tgt, "Repush table (by sequence)", "repush_table", 3,
+        self._row(tgt, "temp1 table (repush source)", "temp1_table", 3,
+                  default=config.DEFAULT_TEMP1)
+        self.vars["create_temp1"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tgt, text="Create temp1 table if it doesn't exist",
+                        variable=self.vars["create_temp1"]).grid(
+            row=4, column=1, sticky="w", padx=8, pady=2)
+        self._row(tgt, "Repush table (by sequence)", "repush_table", 5,
                   default=config.DEFAULT_REPUSH)
-        self._row(tgt, "Settings table", "settings_table", 4,
+        self._row(tgt, "Settings table", "settings_table", 6,
                   default=config.DEFAULT_SETTINGS)
         tgt.columnconfigure(1, weight=1)
 
@@ -113,11 +119,21 @@ class App:
                   default=config.DEFAULT_SLA_HOURS, width=10)
 
         self._build_cutoff_row(params)
+        self._build_created_range_row(params, 5)
+
+        self._row(params, "Createdat from >= (temp1)", "created_from", 6)
+        self._row(params, "Createdat to   <= (temp1)", "created_to", 7)
+        ttk.Label(params, foreground="#888", wraplength=680, justify="left",
+                  text=("^ Createdat from/to select the rows from "
+                        "meter_blockloadprofile that are inserted into temp1 "
+                        "(step 4 repush source: in-SLA + just-fixed rows).")).grid(
+            row=8, column=1, sticky="w", padx=8)
+
         self._build_meter_row(params)
 
         ttk.Label(params, foreground="#888",
                   text="Dates: YYYY-MM-DD HH:MM").grid(
-            row=6, column=1, sticky="w", padx=8)
+            row=10, column=1, sticky="w", padx=8)
         params.columnconfigure(1, weight=1)
 
         rp = ttk.LabelFrame(parent, text="Repush settings (step 4)")
@@ -155,10 +171,34 @@ class App:
             row=0, column=3, padx=4)
         cut.columnconfigure(1, weight=1)
 
+    def _build_created_range_row(self, parent, row):
+        """Optional, tickable createdat lower/upper bounds for step 1 (Check).
+
+        When ticked, these REPLACE the 'createdat > cutoff' test (each bound is
+        used only if filled). Untick to check on the cutoff alone - never both.
+        """
+        cr = ttk.Frame(parent)
+        cr.grid(row=row, column=0, columnspan=2, sticky="ew", padx=4)
+        self.vars["use_created_range"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cr, text="Also limit createdat (step 1)",
+                        variable=self.vars["use_created_range"],
+                        command=self._toggle_created_range).grid(
+            row=0, column=0, padx=4)
+        ttk.Label(cr, text="createdat >").grid(row=0, column=1, sticky="e", padx=2)
+        self.vars["breach_created_gt"] = tk.StringVar()
+        self.breach_gt_entry = ttk.Entry(
+            cr, textvariable=self.vars["breach_created_gt"], width=18)
+        self.breach_gt_entry.grid(row=0, column=2, padx=2)
+        ttk.Label(cr, text="createdat <").grid(row=0, column=3, sticky="e", padx=2)
+        self.vars["breach_created_lt"] = tk.StringVar()
+        self.breach_lt_entry = ttk.Entry(
+            cr, textvariable=self.vars["breach_created_lt"], width=18)
+        self.breach_lt_entry.grid(row=0, column=4, padx=2)
+
     def _build_meter_row(self, parent):
         """Restrict to meternumbers - either from a DB table or an uploaded file."""
         mf = ttk.Frame(parent)
-        mf.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4)
+        mf.grid(row=9, column=0, columnspan=2, sticky="ew", padx=4)
         self.vars["use_meter"] = tk.BooleanVar(value=False)
         ttk.Checkbutton(mf, text="Restrict to meternumbers",
                         variable=self.vars["use_meter"],
@@ -281,6 +321,11 @@ class App:
             self.cutoff_entry.configure(state="readonly")
             self._recompute_cutoff()
 
+    def _toggle_created_range(self):
+        state = "normal" if self.vars["use_created_range"].get() else "disabled"
+        self.breach_gt_entry.configure(state=state)
+        self.breach_lt_entry.configure(state=state)
+
     def _recompute_cutoff(self):
         if self.vars["manual_cutoff"].get():
             return
@@ -348,14 +393,53 @@ class App:
             raise ValueError("RTC 'from' is after RTC 'to'.")
         self._recompute_cutoff()
         cutoff = self.vars["created_cutoff"].get().strip()
-        if not cutoff:
-            raise ValueError("createdat cutoff is empty - check RTC-to / SLA.")
-        parse_dt(cutoff)
+        # cutoff is only needed when NOT using the tickable createdat range.
+        if not self.vars["use_created_range"].get():
+            if not cutoff:
+                raise ValueError("createdat cutoff is empty - check RTC-to / SLA.")
+            parse_dt(cutoff)
         return projectid, rtc_from, rtc_to, cutoff
 
     def _breach_where(self, projectid, rtc_from, rtc_to, cutoff):
+        use_range = self.vars["use_created_range"].get()
+        created_gt = created_lt = None
+        if use_range:
+            gt = self.vars["breach_created_gt"].get().strip()
+            lt = self.vars["breach_created_lt"].get().strip()
+            created_gt = parse_dt(gt) if gt else None
+            created_lt = parse_dt(lt) if lt else None
+            if created_gt is None and created_lt is None:
+                raise ValueError(
+                    "'Also limit createdat (step 1)' is ticked but no createdat "
+                    "bound is set. Fill '>' and/or '<', or untick to use cutoff.")
+            if (created_gt is not None and created_lt is not None
+                    and created_gt >= created_lt):
+                raise ValueError("createdat '>' bound is not before the '<' bound.")
         return build_breach_where(
-            projectid, rtc_from, rtc_to, cutoff,
+            projectid, rtc_from, rtc_to,
+            cutoff=None if use_range else cutoff,   # range mode replaces cutoff
+            use_meter=self.vars["use_meter"].get(),
+            meter_source=self.vars["meter_source"].get(),
+            meter_table=self.vars["meter_table"].get().strip(),
+            meter_values=self.meter_values,
+            created_gt=created_gt, created_lt=created_lt,
+        )
+
+    def _temp1_where(self):
+        """Build the temp1 WHERE (step 4) from the current Run parameters."""
+        projectid = self.vars["projectid"].get().strip()
+        if not projectid:
+            raise ValueError("Project ID is required.")
+        rtc_from = parse_dt(self.vars["rtc_from"].get())
+        rtc_to = parse_dt(self.vars["rtc_to"].get())
+        if rtc_from > rtc_to:
+            raise ValueError("RTC 'from' is after RTC 'to'.")
+        created_from = parse_dt(self.vars["created_from"].get())
+        created_to = parse_dt(self.vars["created_to"].get())
+        if created_from > created_to:
+            raise ValueError("Createdat 'from' is after Createdat 'to'.")
+        return build_temp1_where(
+            projectid, rtc_from, rtc_to, created_from, created_to,
             use_meter=self.vars["use_meter"].get(),
             meter_source=self.vars["meter_source"].get(),
             meter_table=self.vars["meter_table"].get().strip(),
@@ -522,33 +606,48 @@ class App:
             messagebox.showwarning("Profile name required",
                                    "Enter a profile name (Repush settings) first.")
             return
+        try:
+            temp1_where, temp1_params, temp1_preview = self._temp1_where()
+        except ValueError as e:
+            messagebox.showwarning("Repush inputs", str(e))
+            return
+
         projectid = self.vars["projectid"].get().strip()
+        source = self.vars["table"].get().strip() or config.DEFAULT_TABLE
+        temp1 = self.vars["temp1_table"].get().strip() or config.DEFAULT_TEMP1
         by_seq = self.vars["repush_table"].get().strip() or config.DEFAULT_REPUSH
         settings = self.vars["settings_table"].get().strip() or config.DEFAULT_SETTINGS
-        backup = self.vars["backup_table"].get().strip() or config.DEFAULT_BACKUP
+        create_temp1 = self.vars["create_temp1"].get()
         if not messagebox.askyesno(
                 "Confirm repush",
-                f"This will TRUNCATE '{by_seq}', copy the backup ('{backup}') into "
-                f"it, and update one row in '{settings}'\n"
+                f"This will (re)build '{temp1}' from '{source}' where:\n"
+                f"  {chr(10).join('    ' + p for p in temp1_preview)}\n\n"
+                f"then TRUNCATE '{by_seq}', copy '{temp1}' into it, and update one "
+                f"row in '{settings}'\n"
                 f"(projectid={projectid}, profilename='{profilename}', "
+                f"startdate/enddate = min/max(createdat) of '{temp1}', "
                 f"datarepushid taken from '{settings}').\n\nProceed?"):
             return
 
         self._disable_all()
         self.status_var.set("Repushing...")
         self.log("-" * 60)
-        self.log(f"REPUSH: truncating '{by_seq}', copying from '{backup}', "
-                 f"updating '{settings}'...")
+        self.log(f"REPUSH: building '{temp1}' from '{source}', truncating '{by_seq}', "
+                 f"copying from '{temp1}', updating '{settings}'...")
         self._begin_indeterminate("REPUSH")
         threading.Thread(
             target=self._do_repush,
-            args=(self._conn_kw(), by_seq, backup, settings, projectid, profilename),
+            args=(self._conn_kw(), source, temp1, by_seq, settings,
+                  projectid, profilename, temp1_where, temp1_params, create_temp1),
             daemon=True).start()
 
-    def _do_repush(self, conn_kw, by_seq, backup, settings, projectid, profilename):
+    def _do_repush(self, conn_kw, source, temp1, by_seq, settings,
+                   projectid, profilename, temp1_where, temp1_params, create_temp1):
         try:
-            result = db_ops.run_repush(conn_kw, by_seq, backup, settings,
+            result = db_ops.run_repush(conn_kw, source, temp1, by_seq, settings,
                                        projectid, profilename,
+                                       temp1_where, temp1_params,
+                                       create_temp1=create_temp1,
                                        sql_cb=self._sql_cb())
             self.root.after(0, self._repush_done, result)
         except Exception as e:
@@ -556,7 +655,8 @@ class App:
 
     def _repush_done(self, result):
         self._end_progress()
-        self.log(f"REPUSH: inserted {result['inserted']:,} row(s) into the repush "
+        self.log(f"REPUSH: filled temp1 with {result['temp1_count']:,} row(s); "
+                 f"inserted {result['inserted']:,} row(s) into the repush "
                  f"table with datarepushid = {result['datarepushid']}.")
         self.log(f"  settings window: startdate = {result['startdate']}, "
                  f"enddate = {result['enddate']}")
@@ -566,7 +666,8 @@ class App:
         self._restore_buttons()
         messagebox.showinfo(
             "Done",
-            f"Repush complete: {result['inserted']:,} rows.\n"
+            f"Repush complete: temp1 = {result['temp1_count']:,} rows, "
+            f"repushed {result['inserted']:,} rows.\n"
             f"datarepushid = {result['datarepushid']}\n"
             f"startdate = {result['startdate']}\nenddate = {result['enddate']}\n"
             f"snapshot: {result['snapshot_count']:,} rows -> "
@@ -598,3 +699,4 @@ class App:
                 self.vars[k].set(val)
         self._toggle_meter()
         self._toggle_cutoff()
+        self._toggle_created_range()
