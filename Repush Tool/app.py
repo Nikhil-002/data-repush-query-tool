@@ -133,6 +133,8 @@ class App:
     def _build_run(self, parent):
         pad = {"padx": 8, "pady": 4}
 
+        self._build_repush_mode_row(parent, pad)
+
         params = ttk.LabelFrame(parent, text="Run parameters (this RTC day)")
         params.pack(fill="x", **pad)
         self._row(params, "Project ID", "projectid", 0, default="1", width=10)
@@ -175,6 +177,31 @@ class App:
         self._build_result(parent)
         self._build_progress(parent)
         self._build_log(parent)
+
+    def _build_repush_mode_row(self, parent, pad):
+        """
+        Choose (before step 1) what step 4 repushes:
+          * full     - the whole day: temp1 = every packet in the window.
+          * specific - only the breached-and-fixed sequences: temp1 is also
+                       restricted to sequenceids present in the backup table
+                       (temp2), i.e. the rows Check/Backup/Update touched.
+        Only affects how temp1's WHERE is built in step 4; the rest of the
+        workflow is identical.
+        """
+        mode = ttk.LabelFrame(parent, text="Repush mode")
+        mode.pack(fill="x", **pad)
+        self.vars["repush_mode"] = tk.StringVar(value=config.DEFAULT_REPUSH_MODE)
+        ttk.Radiobutton(mode, text="Full day repush (whole window)",
+                        variable=self.vars["repush_mode"], value="full").pack(
+            side="left", padx=8, pady=6)
+        ttk.Radiobutton(mode, text="Specific repush (only backed-up sequences)",
+                        variable=self.vars["repush_mode"], value="specific").pack(
+            side="left", padx=8, pady=6)
+        ttk.Label(parent, foreground="#888", wraplength=680, justify="left",
+                  text=("Full day = repush every packet in the createdat/RTC "
+                        "window. Specific = repush only the sequences saved in "
+                        "the backup table (temp2), i.e. the ones this run "
+                        "fixed.")).pack(anchor="w", padx=12)
 
     def _build_cutoff_row(self, parent):
         """The auto-computed 'createdat > cutoff' deadline (rtc_to + SLA hours)."""
@@ -464,12 +491,18 @@ class App:
         created_to = parse_dt(self.vars["created_to"].get())
         if created_from > created_to:
             raise ValueError("Createdat 'from' is after Createdat 'to'.")
+        # "Specific" repush restricts temp1 to the sequences in the backup table.
+        restrict_seq_table = None
+        if self.vars["repush_mode"].get() == "specific":
+            restrict_seq_table = (self.vars["backup_table"].get().strip()
+                                  or config.DEFAULT_BACKUP)
         return build_temp1_where(
             projectid, rtc_from, rtc_to, created_from, created_to,
             use_meter=self.vars["use_meter"].get(),
             meter_source=self.vars["meter_source"].get(),
             meter_table=self.vars["meter_table"].get().strip(),
             meter_values=self.meter_values,
+            restrict_seq_table=restrict_seq_table,
         )
 
     def _conn_kw(self):

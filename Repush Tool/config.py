@@ -26,6 +26,7 @@ DEFAULT_TEMP1 = "temp1"                            # full good dataset repushed 
 DEFAULT_REPUSH = "data_repush_settings_by_sequence"  # per-sequence repush table
 DEFAULT_SETTINGS = "data_repush_settings"          # parent settings table (owns datarepushid)
 DEFAULT_SLA_HOURS = "11"                            # SLA window in hours
+DEFAULT_REPUSH_MODE = "full"                        # "full" (whole day) or "specific"
 DEFAULT_METER_SOURCE = "table"                      # "table" or "file"
 DEFAULT_METER_TABLE = "june18"                      # example table name
 DEFAULT_PROFILENAME = "EVENTS"                      # profilename written to settings

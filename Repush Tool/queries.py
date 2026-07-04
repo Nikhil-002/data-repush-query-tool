@@ -159,7 +159,8 @@ def build_breach_where(projectid, rtc_from, rtc_to, cutoff=None,
 
 def build_temp1_where(projectid, rtc_from, rtc_to, created_from, created_to,
                       use_meter=False, meter_source="table",
-                      meter_table=None, meter_values=None):
+                      meter_table=None, meter_values=None,
+                      restrict_seq_table=None):
     """
     Build the WHERE clause used to fill temp1 in step 4.
 
@@ -169,6 +170,14 @@ def build_temp1_where(projectid, rtc_from, rtc_to, created_from, created_to,
     the [created_from, created_to] window - i.e. the packets that were already
     in-SLA (LS) PLUS the ones step 3 just pulled back inside SLA (their
     rewritten createdat now falls in this window).
+
+    "Full day" repush leaves ``restrict_seq_table`` None -> temp1 holds every
+    packet in the window. "Specific" repush passes the backup table (temp2) as
+    ``restrict_seq_table`` -> an extra
+    'sequenceid in (select sequenceid from <backup>)' predicate keeps ONLY the
+    sequences that breached SLA and were fixed this run, so just those specific
+    sequences get repushed (their good rows in the window are still taken from
+    the main table, not from the backup).
 
     Returns (where_clause_sql, params, preview_text_lines).
     """
@@ -193,6 +202,15 @@ def build_temp1_where(projectid, rtc_from, rtc_to, created_from, created_to,
 
     _apply_meter_filter(where, params, preview, use_meter, meter_source,
                         meter_table, meter_values)
+
+    # "Specific" repush: keep only the sequences captured in the backup table
+    # (temp2), i.e. the ones that breached SLA and were fixed this run.
+    if restrict_seq_table:
+        where.append(sql.SQL(
+            "sequenceid in (select sequenceid from {})").format(
+                _ident(restrict_seq_table)))
+        preview.append(
+            f"sequenceid in (select sequenceid from {restrict_seq_table})")
 
     return sql.SQL(" and ").join(where), params, preview
 
