@@ -16,8 +16,6 @@ PROFILE_TABLES = {
     "LS":     "public.meter_blockloadprofile",
     "DP":     "public.meter_dailyloadprofile",
     "BP":     "public.meter_billingprofile",
-    "Events": "public.meter_events",
-    "ESW":    "public.meter_eswprofiledata",
 }
 DEFAULT_PROFILE = "LS"                             # selected in the dropdown by default
 DEFAULT_TABLE = PROFILE_TABLES[DEFAULT_PROFILE]    # main table the profile maps to
